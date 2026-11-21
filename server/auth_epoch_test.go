@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Autumn-27/artex/db"
 )
 
 func TestPasswordVersionClaim(t *testing.T) {
@@ -50,7 +52,7 @@ func TestPasswordVersionClaim(t *testing.T) {
 func TestChangePasswordRevokesOldTokenAndKeepsItWhenSaveFails(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
-		t.Skipf("postgres unavailable (%v)", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	defer m.Close()
 
@@ -59,6 +61,7 @@ func TestChangePasswordRevokesOldTokenAndKeepsItWhenSaveFails(t *testing.T) {
 		m:              m,
 		jwtKey:         []byte("0123456789abcdef0123456789abcdef"),
 		loginLimit:     newLoginLimiter(time.Now),
+		pwdLimit:       newLoginLimiter(time.Now),
 		authHashKey:    fmt.Sprintf("test.password_hash.%d", stamp),
 		authVersionKey: fmt.Sprintf("test.password_version.%d", stamp),
 	}
@@ -149,11 +152,11 @@ func TestChangePasswordRevokesOldTokenAndKeepsItWhenSaveFails(t *testing.T) {
 func TestUnreadablePasswordVersionRejectsSessions(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
-		t.Skipf("postgres unavailable (%v)", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	defer m.Close()
 	key := []byte("0123456789abcdef0123456789abcdef")
-	s := &Server{m: m, jwtKey: key, loginLimit: newLoginLimiter(time.Now)}
+	s := &Server{m: m, jwtKey: key, loginLimit: newLoginLimiter(time.Now), pwdLimit: newLoginLimiter(time.Now)}
 	s.authVersionKey = fmt.Sprintf("test.password_version.%d", time.Now().UnixNano())
 	tok, err := signJWTVersion(key, 1)
 	if err != nil {
@@ -185,7 +188,7 @@ func TestUnreadablePasswordVersionRejectsSessions(t *testing.T) {
 func TestLoginRereadsPasswordVersionWhenUnreadable(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
-		t.Skipf("postgres unavailable (%v)", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	defer m.Close()
 
@@ -194,6 +197,7 @@ func TestLoginRereadsPasswordVersionWhenUnreadable(t *testing.T) {
 		m:              m,
 		jwtKey:         []byte("0123456789abcdef0123456789abcdef"),
 		loginLimit:     newLoginLimiter(time.Now),
+		pwdLimit:       newLoginLimiter(time.Now),
 		authHashKey:    fmt.Sprintf("test.password_hash.%d", stamp),
 		authVersionKey: fmt.Sprintf("test.password_version.%d", stamp),
 	}
@@ -248,7 +252,7 @@ func TestLoginRereadsPasswordVersionWhenUnreadable(t *testing.T) {
 func TestAbsentPasswordVersionKeepsSessions(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
-		t.Skipf("postgres unavailable (%v)", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	defer m.Close()
 	key := []byte("0123456789abcdef0123456789abcdef")

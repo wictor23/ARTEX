@@ -14,7 +14,7 @@ func testSetup(t *testing.T) (*DB, *AssetStore, *CompanyStore) {
 	t.Helper()
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v)", err)
+		SkipPGUnavailable(t, err)
 	}
 	return d, d.Assets(), d.Companies()
 }
@@ -879,6 +879,17 @@ func TestMarshalStringArray(t *testing.T) {
 	if got2 != "{}" {
 		t.Errorf("empty: %q", got2)
 	}
+
+	quoted := marshalStringArray([]string{`say "hi"`, `a\b`})
+	if quoted != `{"say \"hi\"","a\\b"}` {
+		t.Errorf("escape: %q", quoted)
+	}
+
+	// A backslash before a quote must not close the element and inject another.
+	injected := marshalStringArray([]string{`x\",evil,\"y`})
+	if strings.Contains(injected, `","evil`) {
+		t.Errorf("backslash-quote split the array: %q", injected)
+	}
 }
 
 // =====================================================================
@@ -1132,6 +1143,7 @@ func TestAssetIPRejectsHostname(t *testing.T) {
 		t.Fatalf("empty ip rejected: %v", err)
 	}
 	deleteAsset(d, id)
+	_, _ = d.Exec(`DELETE FROM assets WHERE domain IN ('ip-guard.example.com','example.com')`)
 	id, err = av2.UpsertIP(UpsertIPReq{IP: "203.0.113.7"})
 	if err != nil {
 		t.Fatalf("valid ip rejected: %v", err)
