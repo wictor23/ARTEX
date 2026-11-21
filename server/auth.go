@@ -5,9 +5,11 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"log"
 	"math/big"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -35,6 +37,8 @@ const (
 	// length, so passwords set under the old 8-character minimum still log in.
 	minPasswordRunes = 12
 	maxPasswordBytes = 72
+
+	pwdLimitTokenPrefix = "tok:"
 )
 
 // errDataSourceUnavailable is the uniform reply when a password-related read fails.
@@ -280,12 +284,59 @@ func extractToken(r *http.Request) string {
 	return r.URL.Query().Get("token")
 }
 
+// cookieAuthenticated reports whether extractToken takes the session from the
+// artex_token cookie. The browser attaches that cookie on its own, to requests
+// a foreign page makes as well; a bearer or query token is put there by the caller.
+func cookieAuthenticated(r *http.Request) bool {
+	if strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+		return false
+	}
+	c, err := r.Cookie("artex_token")
+	return err == nil && c.Value != ""
+}
+
+// sameOrigin reports whether the browser states that the request comes from a
+// page of this server: Sec-Fetch-Site is same-origin, or Origin names the
+// scheme, host and port the request was sent to. Scripts can set neither
+// header. A request that carries neither is not same-origin.
+func sameOrigin(r *http.Request) bool {
+	if r.Header.Get("Sec-Fetch-Site") == "same-origin" {
+		return true
+	}
+	o, err := url.Parse(r.Header.Get("Origin"))
+	if err != nil || o.Host == "" {
+		return false
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	return o.Scheme == scheme && hostWithPort(o.Host, scheme) == hostWithPort(r.Host, scheme)
+}
+
+// hostWithPort returns host in lower case with its port, the scheme's default
+// when host names none.
+func hostWithPort(host, scheme string) string {
+	u := url.URL{Host: host}
+	port := u.Port()
+	if port == "" {
+		port = "80"
+		if scheme == "https" {
+			port = "443"
+		}
+	}
+	return strings.ToLower(u.Hostname()) + ":" + port
+}
+
 // requireAuth wraps h with JWT validation.
-// /api/auth/* and /api/health are exempt.
+// /api/auth/*, /api/health and /api/ready are exempt.
+// A state-changing request whose session is the cookie must be same-origin
+// (see sameOrigin), so that a foreign page cannot act with the operator's
+// session. Requests that carry a bearer token, and GET and HEAD, are not checked.
 func (s *Server) requireAuth(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
-		if strings.HasPrefix(p, "/api/auth/") || p == "/api/health" {
+		if strings.HasPrefix(p, "/api/auth/") || p == "/api/health" || p == "/api/ready" {
 			h.ServeHTTP(w, r)
 			return
 		}
@@ -297,6 +348,13 @@ func (s *Server) requireAuth(h http.Handler) http.Handler {
 		if !s.sessionOK(tok) {
 			writeErr(w, 401, "token is invalid or expired")
 			return
+		}
+		switch r.Method {
+		case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+			if cookieAuthenticated(r) && !sameOrigin(r) {
+				writeErr(w, 403, "cross-origin request refused: a cookie session can change state only from the console's own origin; send the token as Authorization: Bearer instead")
+				return
+			}
 		}
 		h.ServeHTTP(w, r)
 	})
@@ -319,9 +377,15 @@ func (s *Server) authStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"initialized": hash != ""})
 }
 
+// setupTokenOut is where the setup token is printed: the stderr of the process.
+// It is a variable so that tests can capture it.
+var setupTokenOut io.Writer = os.Stderr
+
 // initSetupToken generates the one-time setup token when no admin password is set
-// and writes it to the server log. Without it, anyone who can reach the port
+// and prints it on the server console. Without it, anyone who can reach the port
 // before the operator could claim the instance through POST /api/auth/init.
+// The token goes to stderr directly, not through the standard logger: the log
+// sink keeps every line for /api/logs and persists it.
 func (s *Server) initSetupToken() {
 	if s.m == nil || s.m.pg == nil {
 		return
@@ -354,7 +418,8 @@ func (s *Server) initSetupToken() {
 	s.setupMu.Lock()
 	s.setupToken = token
 	s.setupMu.Unlock()
-	log.Printf("[auth] no admin password is set. Setup token for the /setup page: %s", token)
+	fmt.Fprintln(setupTokenOut, time.Now().Format("2006/01/02 15:04:05"), "[auth] no admin password is set. Setup token for the /setup page:", token)
+	log.Printf("[auth] no admin password is set. The setup token for the /setup page was printed on the server console (stderr); it is not kept in this log")
 }
 
 // loadPasswordVersion reads auth.password_version. A missing key leaves the
@@ -479,6 +544,12 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 401, "Unauthorized")
 		return
 	}
+	if wait := s.passwordChangeWait(r); wait > 0 {
+		secs := int((wait + time.Second - 1) / time.Second)
+		w.Header().Set("Retry-After", strconv.Itoa(secs))
+		writeErr(w, 429, fmt.Sprintf("Too many password change attempts, try again in %d seconds", secs))
+		return
+	}
 	var req struct {
 		OldPassword string `json:"old_password"`
 		NewPassword string `json:"new_password"`
@@ -520,8 +591,29 @@ func (s *Server) authChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "Save failed: "+err.Error())
 		return
 	}
+	s.passwordChangeReset(r)
 	s.applyPasswordVersion(version)
 	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+// passwordChangeWait records one authenticated change-password attempt against
+// the client IP and the session token. Either bucket can block; rotating the
+// source address with a stolen token still hits the token bucket.
+func (s *Server) passwordChangeWait(r *http.Request) time.Duration {
+	if s.pwdLimit == nil {
+		return 0
+	}
+	ip := clientIP(r, s.trustedProxies)
+	tok := pwdLimitTokenPrefix + extractToken(r)
+	return max(s.pwdLimit.allow(ip), s.pwdLimit.allow(tok))
+}
+
+func (s *Server) passwordChangeReset(r *http.Request) {
+	if s.pwdLimit == nil {
+		return
+	}
+	s.pwdLimit.reset(clientIP(r, s.trustedProxies))
+	s.pwdLimit.reset(pwdLimitTokenPrefix + extractToken(r))
 }
 
 // POST /api/auth/login — validates username/password and returns a JWT.

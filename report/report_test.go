@@ -1,6 +1,8 @@
 package report
 
 import (
+	"bytes"
+	"encoding/csv"
 	"fmt"
 	"strings"
 	"testing"
@@ -312,5 +314,90 @@ func TestFindingsExportsCarryQuality(t *testing.T) {
 		t.Errorf("export repeats the binding count next to its traffic section\n%s", md)
 	} else if !strings.Contains(md, "bindings: 1") {
 		t.Errorf("export lost the binding count entirely\n%s", md)
+	}
+}
+
+func TestFindingsCSVNeutralizesFormulas(t *testing.T) {
+	out := FindingsCSV([]*db.DBFinding{{
+		ID:              7,
+		Name:            `=HYPERLINK("http://evil.example/x","x")`,
+		VulnClass:       "+cmd",
+		Severity:        "high",
+		Status:          "pending",
+		ReportState:     "none",
+		TaskDescription: "@SUM(1+1)",
+		CreatedAt:       time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
+		Summary:         "-2+3",
+	}})
+	if !bytes.HasPrefix(out, []byte("\xEF\xBB\xBF")) {
+		t.Fatal("CSV lost the UTF-8 BOM")
+	}
+	records, err := csv.NewReader(bytes.NewReader(out[3:])).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("rows=%d, want header+1", len(records))
+	}
+	row := records[1]
+	want := map[int]string{
+		1: `'=HYPERLINK("http://evil.example/x","x")`,
+		2: `'+cmd`,
+		6: `'@SUM(1+1)`,
+		8: `'-2+3`,
+	}
+	for i, prefix := range want {
+		if row[i] != prefix {
+			t.Errorf("col %d = %q, want %q", i, row[i], prefix)
+		}
+	}
+	if strings.HasPrefix(row[3], "'") {
+		t.Errorf("plain severity %q should not be prefixed", row[3])
+	}
+}
+
+func TestFindingFilenameUnicodeAndIDSuffix(t *testing.T) {
+	// Vocalized Arabic should strip combining diacritics cleanly rather than inserting underscores.
+	arabic := FindingFilename(&db.DBFinding{
+		ID:       42,
+		Severity: "critical",
+		Name:     "ثَغْرَة حَقْن SQL",
+	})
+	if arabic != "critical_ثغرة_حقن_SQL_42.md" {
+		t.Fatalf("arabic filename = %q, want %q", arabic, "critical_ثغرة_حقن_SQL_42.md")
+	}
+
+	// Composed Latin/Turkish letters stay intact after NFC normalization.
+	turkish := FindingFilename(&db.DBFinding{
+		ID:       9,
+		Severity: "medium",
+		Name:     "Gu\u0308venlik Ac\u0327ıg\u0306ı",
+	})
+	if turkish != "medium_Güvenlik_Açığı_9.md" {
+		t.Fatalf("turkish filename = %q, want %q", turkish, "medium_Güvenlik_Açığı_9.md")
+	}
+
+	// BiDi RLO control characters are stripped without breaking words.
+	bidi := FindingFilename(&db.DBFinding{
+		ID:       15,
+		Severity: "high",
+		Name:     "upload\u202Egpj.exe",
+	})
+	if strings.ContainsRune(bidi, '\u202E') || bidi != "high_uploadgpj.exe_15.md" {
+		t.Fatalf("bidi filename = %q", bidi)
+	}
+
+	// Long multi-byte titles stay valid UTF-8, within 120 bytes before .md, and keep distinct ID suffixes.
+	longPrefix := strings.Repeat("اختراق_صلاحيات_", 10)
+	f1 := FindingFilename(&db.DBFinding{ID: 101, Severity: "high", Name: longPrefix + "أ"})
+	f2 := FindingFilename(&db.DBFinding{ID: 102, Severity: "high", Name: longPrefix + "ب"})
+	for _, name := range []string{f1, f2} {
+		base := strings.TrimSuffix(name, ".md")
+		if len(base) > maxFindingFilenameBaseBytes {
+			t.Fatalf("filename base %q exceeds %d bytes (%d)", base, maxFindingFilenameBaseBytes, len(base))
+		}
+	}
+	if !strings.HasSuffix(f1, "_101.md") || !strings.HasSuffix(f2, "_102.md") || f1 == f2 {
+		t.Fatalf("expected preserved distinct ID suffixes: f1=%q f2=%q", f1, f2)
 	}
 }
